@@ -1,10 +1,13 @@
-use core::panic;
+use core::{
+    ops::{Deref, DerefMut},
+    panic,
+};
 
 use super::{
     devices::plic::{PlicState, MAX_CONTEXTS},
     regs::GeneralPurposeRegisters,
-    sbi::PmuFunction,
     sbi::{BaseFunction, RemoteFenceFunction},
+    sbi::{HsmFunction, PmuFunction},
     traps,
     vcpu::{self, VmCpuRegisters},
     vm_pages::VmPages,
@@ -18,18 +21,18 @@ use riscv_decode::Instruction;
 use sbi_rt::{pmu_counter_get_info, pmu_counter_stop};
 
 /// A VM that is being run.
-pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
-    vcpus: VmCpus<H>,
+pub struct VM<G: GuestPageTableTrait> {
+    // vcpus: VmCpus<H>,
     gpt: G,
     vm_pages: VmPages,
     plic: PlicState,
 }
 
-impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
+impl<G: GuestPageTableTrait> VM<G> {
     /// Create a new VM with `vcpus` vCPUs and `gpt` as the guest page table.
-    pub fn new(vcpus: VmCpus<H>, gpt: G) -> HyperResult<Self> {
+    pub fn new(gpt: G) -> HyperResult<Self> {
         Ok(Self {
-            vcpus,
+            // vcpus,
             gpt,
             vm_pages: VmPages::default(),
             plic: PlicState::new(0xC00_0000),
@@ -37,31 +40,33 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
     }
 
     /// Initialize `VCpu` by `vcpu_id`.
-    pub fn init_vcpu(&mut self, vcpu_id: usize) {
-        let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
+    pub fn init_vcpu<H: HyperCraftHal>(&mut self, vcpu: &mut VCpu<H>) {
         vcpu.init_page_map(self.gpt.token());
     }
 
     #[allow(unused_variables, deprecated)]
     /// Run the host VM's vCPU with ID `vcpu_id`. Does not return.
-    pub fn run(&mut self, vcpu_id: usize) {
-        let mut vm_exit_info: VmExitInfo;
+    pub fn run<H: HyperCraftHal, B>(lock_vm: impl Fn() -> B, vcpu: &mut VCpu<H>, init: impl Fn(usize, usize, usize))
+    where
+        B: Deref<Target = Self> + DerefMut,
+    {
         let mut gprs = GeneralPurposeRegisters::default();
         loop {
             let mut len = 4;
             let mut advance_pc = false;
-            {
-                let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
-                vm_exit_info = vcpu.run();
-                vcpu.save_gprs(&mut gprs);
-            }
+            // let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
+            let vm_exit_info = vcpu.run();
+            vcpu.save_gprs(&mut gprs);
+
+            let mut vm = lock_vm();
+            let vm = &mut *vm;
 
             match vm_exit_info {
                 VmExitInfo::Ecall(sbi_msg) => {
                     if let Some(sbi_msg) = sbi_msg {
                         match sbi_msg {
                             HyperCallMsg::Base(base) => {
-                                self.handle_base_function(base, &mut gprs).unwrap();
+                                vm.handle_base_function(base, &mut gprs).unwrap();
                             }
                             HyperCallMsg::GetChar => {
                                 let c = sbi_rt::legacy::console_getchar();
@@ -71,29 +76,29 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 sbi_rt::legacy::console_putchar(c);
                             }
                             HyperCallMsg::SetTimer(timer) => {
-                                sbi_rt::set_timer(timer as u64);
-                                // Clear guest timer interrupt
-                                CSR.hvip.read_and_clear_bits(
-                                    traps::interrupt::VIRTUAL_SUPERVISOR_TIMER,
-                                );
-                                //  Enable host timer interrupt
-                                CSR.sie
-                                    .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+                                vcpu.set_vstimecmp(timer);
                             }
                             HyperCallMsg::Reset(_) => {
                                 sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
                             }
                             HyperCallMsg::RemoteFence(rfnc) => {
-                                self.handle_rfnc_function(rfnc, &mut gprs).unwrap();
+                                vm.handle_rfnc_function(rfnc, &mut gprs).unwrap();
                             }
                             HyperCallMsg::PMU(pmu) => {
-                                self.handle_pmu_function(pmu, &mut gprs).unwrap();
+                                vm.handle_pmu_function(pmu, &mut gprs).unwrap();
+                            }
+                            HyperCallMsg::HSM(hsm) => {
+                                // todo!("hsm");
+                                vm.handle_hsm_function(hsm, &init, &mut gprs).unwrap();
+                                // yielder();
                             }
                             _ => todo!(),
                         }
                         advance_pc = true;
                     } else {
-                        panic!()
+                        gprs.set_reg(GprIndex::A0, 0);
+                        advance_pc = true;
+                        // panic!()
                     }
                 }
                 VmExitInfo::PageFault {
@@ -103,7 +108,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     priv_level,
                 } => match priv_level {
                     super::vmexit::PrivilegeLevel::Supervisor => {
-                        match self.handle_page_fault(falut_pc, inst, fault_addr, &mut gprs) {
+                        match vm.handle_page_fault(falut_pc, inst, fault_addr, &mut gprs) {
                             Ok(inst_len) => {
                                 len = inst_len;
                             }
@@ -120,21 +125,28 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                         panic!("User page fault")
                     }
                 },
-                VmExitInfo::TimerInterruptEmulation => {
-                    // debug!("timer irq emulation");
-                    // Enable guest timer interrupt
+                VmExitInfo::TimerInterruptEmulation | VmExitInfo::ExternalInterruptEmulation => {
                     CSR.hvip
-                        .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
-                    // Clear host timer interrupt
-                    CSR.sie
-                        .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                        .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_SOFT);
+
+                    vm.handle_irq();
+                    unsafe {
+                        core::arch::asm!("
+                            csrc sie, {r}
+                            csrsi sstatus, 2
+                            csrci sstatus, 2
+                            csrs sie, {r}",
+                            r = in(reg) (1 << 9),
+                        );
+
+                        core::arch::asm!("csrci sstatus, 2");
+                    }
                 }
-                VmExitInfo::ExternalInterruptEmulation => self.handle_irq(),
                 _ => {}
             }
 
             {
-                let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
+                // let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
                 vcpu.restore_gprs(&gprs);
                 if advance_pc {
                     vcpu.advance_pc(len);
@@ -145,7 +157,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
 }
 
 // Privaie methods implementation
-impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
+impl<G: GuestPageTableTrait> VM<G> {
     fn handle_page_fault(
         &mut self,
         inst_addr: GuestVirtAddr,
@@ -170,11 +182,12 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
         fault_addr: GuestPhysAddr,
         gprs: &mut GeneralPurposeRegisters,
     ) -> HyperResult<usize> {
-        if inst == 0 {
-            // If hinst does not provide information about trap,
-            // we must read the instruction from guest's memory maunally.
-            inst = self.vm_pages.fetch_guest_instruction(inst_addr)?;
-        }
+        // if inst == 0 {
+        //     // If hinst does not provide information about trap,
+        //     // we must read the instruction from guest's memory maunally.
+        //     inst = self.vm_pages.fetch_guest_instruction(inst_addr)?;
+        // }
+        inst = self.vm_pages.fetch_guest_instruction(inst_addr)?;
         let i1 = inst as u16;
         let len = riscv_decode::instruction_length(i1);
         let inst = match len {
@@ -201,12 +214,17 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
     fn handle_irq(&mut self) {
         let context_id = 1;
         let claim_and_complete_addr = self.plic.base() + 0x0020_0004 + 0x1000 * context_id;
-        let irq = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
-        assert!(irq != 0);
-        self.plic.claim_complete[context_id] = irq;
 
-        CSR.hvip
-            .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_EXTERNAL);
+        loop {
+            let irq = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
+            if irq == 0 {
+                break;
+            }
+            self.plic.claim_complete[context_id] = irq;
+
+            CSR.hvip
+                .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_EXTERNAL);
+        }
     }
 
     fn handle_base_function(
@@ -232,8 +250,11 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 gprs.set_reg(GprIndex::A1, impl_version);
             }
             BaseFunction::ProbeSbiExtension(extension) => {
-                let extension = sbi_rt::probe_extension(extension as usize).raw;
-                gprs.set_reg(GprIndex::A1, extension);
+                let res = sbi_rt::probe_extension(extension as usize).raw;
+                // if extension == 0x48534D {
+                //     gprs.set_reg(GprIndex::A1, 0);
+                // } else {
+                gprs.set_reg(GprIndex::A1, res);
             }
             BaseFunction::GetMachineVendorID => {
                 let mvendorid = sbi_rt::get_mvendorid();
@@ -279,6 +300,18 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 gprs.set_reg(GprIndex::A1, sbi_ret.value);
             }
         }
+        Ok(())
+    }
+
+    fn handle_hsm_function(
+        &self,
+        hsm: HsmFunction,
+        init: impl Fn(usize, usize, usize),
+        gprs: &mut GeneralPurposeRegisters,
+    ) -> HyperResult<()> {
+        init(hsm.hart_id, hsm.entry, hsm.opaque);
+        gprs.set_reg(GprIndex::A0, 0);
+        gprs.set_reg(GprIndex::A1, 0);
         Ok(())
     }
 

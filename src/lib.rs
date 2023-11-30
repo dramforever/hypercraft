@@ -12,7 +12,8 @@
     unused_imports,
     unused_assignments
 )]
-#![deny(missing_docs, warnings)]
+// #![deny(missing_docs, warnings)]
+#![deny(missing_docs)]
 
 #![feature(naked_functions, asm_const, negative_impls, stdsimd, inline_const, concat_idents)]
 

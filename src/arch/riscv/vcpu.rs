@@ -47,6 +47,7 @@ struct GuestCpuState {
 #[derive(Default)]
 #[repr(C)]
 pub struct GuestVsCsrs {
+    hgatp: usize,
     htimedelta: usize,
     vsstatus: usize,
     vsie: usize,
@@ -129,6 +130,13 @@ macro_rules! guest_csr_offset {
     };
 }
 
+#[allow(unused_macros)]
+macro_rules! guest_vs_offset {
+    ($reg:tt) => {
+        offset_of!(VmCpuRegisters, vs_csrs) + offset_of!(GuestVsCsrs, $reg)
+    };
+}
+
 global_asm!(
     include_str!("guest.S"),
     hyp_ra = const hyp_gpr_offset(GprIndex::RA),
@@ -196,6 +204,18 @@ global_asm!(
     guest_scounteren = const guest_csr_offset!(scounteren),
     guest_sepc = const guest_csr_offset!(sepc),
 
+    guest_hgatp = const guest_vs_offset!(hgatp),
+    guest_htimedelta = const guest_vs_offset!(htimedelta),
+    guest_vsstatus = const guest_vs_offset!(vsstatus),
+    guest_vsie = const guest_vs_offset!(vsie),
+    guest_vstvec = const guest_vs_offset!(vstvec),
+    guest_vsscratch = const guest_vs_offset!(vsscratch),
+    guest_vsepc = const guest_vs_offset!(vsepc),
+    guest_vscause = const guest_vs_offset!(vscause),
+    guest_vstval = const guest_vs_offset!(vstval),
+    guest_vsatp = const guest_vs_offset!(vsatp),
+    guest_vstimecmp = const guest_vs_offset!(vstimecmp),
+
 );
 
 extern "C" {
@@ -223,7 +243,7 @@ pub struct VCpu<H: HyperCraftHal> {
 
 impl<H: HyperCraftHal> VCpu<H> {
     /// Create a new vCPU
-    pub fn new(vcpu_id: usize, entry: GuestPhysAddr) -> Self {
+    pub fn new(vcpu_id: usize) -> Self {
         let mut regs = VmCpuRegisters::default();
         // Set hstatus
         let mut hstatus = LocalRegisterCopy::<usize, hstatus::Register>::new(
@@ -238,13 +258,14 @@ impl<H: HyperCraftHal> VCpu<H> {
         // Set sstatus
         let mut sstatus = sstatus::read();
         sstatus.set_spp(sstatus::SPP::Supervisor);
+        // sstatus.set_sie(false);
         regs.guest_regs.sstatus = sstatus.bits();
 
-        regs.guest_regs.gprs.set_reg(GprIndex::A0, 0);
-        regs.guest_regs.gprs.set_reg(GprIndex::A1, 0x9000_0000);
+        // regs.guest_regs.gprs.set_reg(GprIndex::A0, vcpu_id);
+        // regs.guest_regs.gprs.set_reg(GprIndex::A1, a1);
 
-        // Set entry
-        regs.guest_regs.sepc = entry;
+        // // Set entry
+        // regs.guest_regs.sepc = entry;
         Self {
             vcpu_id,
             regs,
@@ -253,16 +274,21 @@ impl<H: HyperCraftHal> VCpu<H> {
         }
     }
 
+    /// Initialize `VCpu` with entrypoint and two registers
+    pub fn init(&mut self, entry: usize, a0: usize, a1: usize) {
+        self.regs.guest_regs.gprs.set_reg(GprIndex::A0, a0);
+        self.regs.guest_regs.gprs.set_reg(GprIndex::A1, a1);
+        self.regs.guest_regs.sepc = entry;
+    }
+
     /// Initialize nested mmu.
     pub fn init_page_map(&mut self, token: usize) {
         // Set hgatp
         // TODO: Sv39 currently, but should be configurable
         self.regs.virtual_hs_csrs.hgatp = token;
         unsafe {
-            core::arch::asm!(
-                "csrw hgatp, {hgatp}",
-                hgatp = in(reg) self.regs.virtual_hs_csrs.hgatp,
-            );
+            core::arch::asm!("csrs henvcfg, {}", in(reg) (1usize << 63));
+            self.set_hgatp(token);
             core::arch::riscv64::hfence_gvma_all();
         }
     }
@@ -288,6 +314,16 @@ impl<H: HyperCraftHal> VCpu<H> {
                     .reg(GprIndex::from_raw(index).unwrap()),
             );
         }
+    }
+
+    /// Set vstimecmp
+    pub fn set_vstimecmp(&mut self, value: usize) {
+        self.regs.vs_csrs.vstimecmp = value;
+    }
+
+    /// Set hgatp
+    pub fn set_hgatp(&mut self, value: usize) {
+        self.regs.vs_csrs.hgatp = value;
     }
 
     /// Runs this vCPU until traps.
@@ -340,11 +376,13 @@ impl<H: HyperCraftHal> VCpu<H> {
                 }
             }
             _ => {
+                let pa = regs.trap_csrs.htval << 2 | regs.trap_csrs.stval & 0x3;
+
                 panic!(
-                    "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",
+                    "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}, pa: {pa:#x}",
                     scause.cause(),
                     regs.guest_regs.sepc,
-                    regs.trap_csrs.stval
+                    regs.trap_csrs.stval,
                 );
             }
         }

@@ -76,11 +76,11 @@ impl<H: HyperCraftHal> PerCpu<H> {
         Ok(())
     }
 
-    /// Create a `Vcpu`, set the entry point to `entry` and bind this vcpu into the current CPU.
-    pub fn create_vcpu(&mut self, vcpu_id: usize, entry: GuestPhysAddr) -> HyperResult<VCpu<H>> {
-        self.vcpu_queue.lock().push_back(vcpu_id);
-        Ok(VCpu::<H>::new(vcpu_id, entry))
-    }
+    // /// Create a `Vcpu`, set the entry point to `entry` and bind this vcpu into the current CPU.
+    // pub fn create_vcpu(&mut self, vcpu_id: usize, entry: GuestPhysAddr) -> HyperResult<VCpu<H>> {
+    //     self.vcpu_queue.lock().push_back(vcpu_id);
+    //     Ok(VCpu::<H>::new(vcpu_id, entry))
+    // }
 
     /// Returns this CPU's `PerCpu` structure.
     pub fn this_cpu() -> &'static mut PerCpu<H> {

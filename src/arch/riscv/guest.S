@@ -29,6 +29,25 @@ _run_guest:
     sd   s11, ({hyp_s11})(a0)
     sd   sp, ({hyp_sp})(a0)
 
+    .macro load_vs name, offset
+        ld t1, \offset(a0)
+        csrw \name, t1
+    .endm
+
+    load_vs hgatp, {guest_hgatp}
+    load_vs htimedelta, {guest_htimedelta}
+    load_vs vsstatus, {guest_vsstatus}
+    load_vs vsie, {guest_vsie}
+    load_vs vstvec, {guest_vstvec}
+    load_vs vsscratch, {guest_vsscratch}
+    load_vs vsepc, {guest_vsepc}
+    load_vs vscause, {guest_vscause}
+    load_vs vstval, {guest_vstval}
+    load_vs vsatp, {guest_vsatp}
+    load_vs vstimecmp, {guest_vstimecmp}
+
+    hfence.gvma
+
     /* Swap in guest CSRs. */
     ld    t1, ({guest_sstatus})(a0)
     csrrw t1, sstatus, t1
@@ -133,6 +152,7 @@ _guest_exit:
 _restore_csrs:
     /* Swap in hypervisor CSRs. */
     ld    t1, ({hyp_sstatus})(a0)
+    andi  t1, t1, ~ (1 << 1) /* Clear SIE */
     csrrw t1, sstatus, t1
     sd    t1, ({guest_sstatus})(a0)
 
@@ -154,6 +174,23 @@ _restore_csrs:
     csrr  t1, sepc
     sd    t1, ({guest_sepc})(a0)
 
+
+    .macro store_vs name, offset
+        csrr t1, \name
+        sd t1, \offset(a0)
+    .endm
+
+    store_vs hgatp, {guest_hgatp}
+    store_vs htimedelta, {guest_htimedelta}
+    store_vs vsstatus, {guest_vsstatus}
+    store_vs vsie, {guest_vsie}
+    store_vs vstvec, {guest_vstvec}
+    store_vs vsscratch, {guest_vsscratch}
+    store_vs vsepc, {guest_vsepc}
+    store_vs vscause, {guest_vscause}
+    store_vs vstval, {guest_vstval}
+    store_vs vsatp, {guest_vsatp}
+    store_vs vstimecmp, {guest_vstimecmp}
 
     /* Restore hypervisor GPRs. */
     ld   ra, ({hyp_ra})(a0)

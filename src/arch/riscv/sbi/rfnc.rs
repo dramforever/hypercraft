@@ -1,4 +1,4 @@
-use sbi_spec::rfnc::{REMOTE_FENCE_I, REMOTE_SFENCE_VMA};
+use sbi_spec::rfnc::{REMOTE_FENCE_I, REMOTE_SFENCE_VMA, REMOTE_SFENCE_VMA_ASID};
 
 use crate::HyperResult;
 
@@ -23,7 +23,7 @@ impl RemoteFenceFunction {
                 hart_mask: args[0] as u64,
                 hart_mask_base: args[1] as u64,
             }),
-            REMOTE_SFENCE_VMA => Ok(Self::RemoteSFenceVMA {
+            REMOTE_SFENCE_VMA | REMOTE_SFENCE_VMA_ASID => Ok(Self::RemoteSFenceVMA {
                 hart_mask: args[0] as u64,
                 hart_mask_base: args[1] as u64,
                 start_addr: args[2] as u64,
